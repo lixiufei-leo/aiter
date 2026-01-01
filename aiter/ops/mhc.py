@@ -21,8 +21,25 @@ def mhc_pre_gemm_sqrsum(
     x: Tensor,
     fn: Tensor,
     tile_k: int = 128,  # 64 or 128
-    w_preshuffle_bf16: int = 0,  # 1: fn is pre-packed BF16 hi/lo from mhc_shuffle_fn
+    # 1: fn is pre-packed BF16 hi/lo from mhc_shuffle_fn.
+    # 2: fn is plain FP32; the kernel splits it into the same BF16 hi/lo pair on the
+    #    fly (wave64 CDNA bf16 MFMA, bf16 x only; otherwise the FP32 path).
+    w_preshuffle_bf16: int = 0,
 ) -> None: ...
+
+
+def _mhc_pre_fn_split_enabled(x: torch.Tensor, fn: torch.Tensor) -> bool:
+    """Run an unpacked FP32 ``fn`` through the BF16 hi/lo MFMA path (mode 2).
+
+    hi = bf16(fn), lo = bf16(fn - hi) keeps ~16 mantissa bits of every weight (the
+    same split mhc_shuffle_fn stores) and bf16 x is exact, so the projection keeps
+    near-FP32 accuracy at bf16 MFMA rate. Measured on gfx950 only.
+    """
+    return (
+        x.dtype == torch.bfloat16
+        and fn.dtype == torch.float32
+        and get_gfx_runtime() == "gfx950"
+    )
 
 
 def mhc_fn_kb(arch: str | None = None) -> int:
@@ -715,13 +732,16 @@ def mhc_pre(
     sqrsum = torch.empty(selected_splitk, m, dtype=dtypes.fp32, device=device)
     # The packed-weight flag selects BF16 compute. The public interface has
     # already restored an ordinary residual layout when requested above.
+    gemm_mode = int(bool(w_preshuffle_bf16))
+    if not gemm_mode and _mhc_pre_fn_split_enabled(residual, fn):
+        gemm_mode = 2
     mhc_pre_gemm_sqrsum(
         out,
         sqrsum,
         residual,
         fn,
         selected_tile_k,
-        w_preshuffle_bf16=w_preshuffle_bf16,
+        w_preshuffle_bf16=gemm_mode,
     )
     # out = out.sum(0)
     # sqrsum = sqrsum.sum(0)

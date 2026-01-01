@@ -12,6 +12,8 @@ void mhc_pre_gemm_sqrsum(aiter_tensor_t& out,    // (split_k, m, hc_mult3) / (m,
                          aiter_tensor_t& x,      // (m, hc_hidden_size)
                          aiter_tensor_t& fn,     // (hc_mult3, hc_hidden_size) fp32; packed int32 when w_preshuffle_bf16
                          int tile_k = 128,
+                         // 0: FP32 fn; 1: fn packed by mhc_shuffle_fn; 2: FP32 fn split
+                         // into BF16 hi/lo in-kernel (bf16 x on wave64 CDNA, else FP32)
                          int w_preshuffle_bf16 = 0);
 void mhc_pre_big_fuse(aiter_tensor_t& post_mix,        // (m, hc_mult)
                       aiter_tensor_t& comb_mix,        // (m, hc_mult * hc_mult)

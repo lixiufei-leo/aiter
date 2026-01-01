@@ -200,7 +200,12 @@ namespace aiter {
     mma_f32_16x16x4_fma((a), (b), (c))
 #endif
 
-    template <typename DTYPE_I, int num_warps, int tile_m, int tile_n, int tile_k, bool w_preshuffle_bf16 = false, bool vector_fn_load = false>
+    // fn_split_bf16: fn is plain FP32 in global memory; each staged LDS tile is rewritten
+    // in place into hi = bf16(fn), lo = bf16(fn - fp32(hi)) -- bit-identical to what
+    // mhc_shuffle_fn packs -- so the wave64 CDNA bf16 MFMA path runs without a
+    // pre-packed weight. Only meaningful with w_preshuffle_bf16 == false; arches without
+    // the wave64 bf16 MFMA path ignore it and keep the FP32 MFMA loop.
+    template <typename DTYPE_I, int num_warps, int tile_m, int tile_n, int tile_k, bool w_preshuffle_bf16 = false, bool vector_fn_load = false, bool fn_split_bf16 = false>
     __global__ __launch_bounds__(num_warps *  opus::get_warp_size(), 2)
     void mhc_pre_gemm_sqrsum_kernel(
         float* out,
@@ -434,6 +439,10 @@ namespace aiter {
             v_a[0] = load_vector_nbytes<DTYPE_I, vec_tile, 8 * sizeof(DTYPE_I), 0, true, interleave_size>(g_a, ga_offset);
             __builtin_amdgcn_sched_barrier(0);
             lds_load_fn_tile(0);
+            // The vmcnt waits below assume the issue order x0, fn0, x1, fn1. Without this
+            // barrier the scheduler may hoist x1 above the fn0 LDS DMA, and then the first
+            // step's wait no longer covers fn0: its tile can be read before it lands.
+            __builtin_amdgcn_sched_barrier(0);
             v_a[1] = load_vector_nbytes<DTYPE_I, vec_tile, 8 * sizeof(DTYPE_I), 0, true, interleave_size>(g_a, ga_offset + tile_k);
             lds_load_fn_tile(1);
         }
@@ -587,6 +596,55 @@ namespace aiter {
             }
         };
 
+        // fn_split_bf16: once the plain FP32 fn tile has landed in LDS, rewrite it in place
+        // into the block-interleaved hi/lo layout lds_read_fn_chunk_bf16 reads, with the
+        // RNE split mhc_shuffle_fn uses (hi = bf16(f), lo = bf16(f - fp32(hi))), so the
+        // MFMA loop below is the packed path verbatim. Done once per workgroup instead
+        // of once per wave. The XOR swizzle maps every aligned 8-float logical block onto
+        // one aligned 8-float physical block, so each thread owns whole blocks and the
+        // rewrite is race-free. Caller provides the barriers on both sides.
+        auto lds_split_fn_tile = [&](float* s_fn_slot) {
+            static_assert(tile_k % mhc_fn_kb == 0 && mhc_fn_kb == 8,
+                          "in-place fn split assumes 8-element hi/lo blocks");
+            static constexpr int blks_per_row = tile_k / 8;
+            static constexpr int n_blks = tile_n * blks_per_row;
+            #pragma unroll
+            for (int blk = threadIdx.x; blk < n_blks; blk += block_size) {
+                int fn_row = blk / blks_per_row;
+                int K0 = (blk % blks_per_row) * 8;
+                int mask = (fn_row & 0xF) << fn_xor_shift;
+                float* rp = s_fn_slot + fn_row * tile_k;
+                float f[8];
+                if constexpr (fn_vec_size == 1) {
+                    #pragma unroll
+                    for (int t = 0; t < 8; t++) f[t] = rp[(K0 + t) ^ mask];
+                } else {
+                    // mask's low two bits are zero: aligned 4-float runs stay contiguous.
+                    *reinterpret_cast<fp32x4_t*>(f) = *reinterpret_cast<fp32x4_t*>(rp + (K0 ^ mask));
+                    *reinterpret_cast<fp32x4_t*>(f + 4) = *reinterpret_cast<fp32x4_t*>(rp + ((K0 + 4) ^ mask));
+                }
+                opus::vector_t<opus::bf16_t, 8> hi, lo;
+                #pragma unroll
+                for (int t = 0; t < 8; t++) {
+                    hi[t] = opus::fp32_to_bf16(f[t]);
+                    lo[t] = opus::fp32_to_bf16(f[t] - static_cast<float>(hi[t]));
+                }
+                fp32x4_t hi_f = __builtin_bit_cast(fp32x4_t, hi);
+                fp32x4_t lo_f = __builtin_bit_cast(fp32x4_t, lo);
+                const int hi_pos = mhc_fn_hi_float(K0);
+                if constexpr (fn_vec_size == 1) {
+                    #pragma unroll
+                    for (int t = 0; t < 4; t++) {
+                        rp[(hi_pos + t) ^ mask] = hi_f[t];
+                        rp[(hi_pos + mhc_fn_lo_off + t) ^ mask] = lo_f[t];
+                    }
+                } else {
+                    *reinterpret_cast<fp32x4_t*>(rp + (hi_pos ^ mask)) = hi_f;
+                    *reinterpret_cast<fp32x4_t*>(rp + ((hi_pos + mhc_fn_lo_off) ^ mask)) = lo_f;
+                }
+            }
+        };
+
 #define GEMM_LOOP_BODY_BF16(BUF, LDS_SLOT, k, DO_PREFETCH)                                        \
         do {                                                                                      \
             if (n_idx == 0) {                                                                     \
@@ -611,22 +669,39 @@ namespace aiter {
             }                                                                                     \
             __builtin_amdgcn_s_barrier();                                                         \
             float* s_fn_rd_ptr = s_fn + (LDS_SLOT) * tile_n * tile_k;                             \
+            if constexpr (fn_split_bf16) {                                                        \
+                /* s_waitcnt / s_barrier are no-mem to the compiler: pin the LDS     */           \
+                /* accesses between them with compiler barriers on both sides.       */           \
+                asm volatile("" ::: "memory");                                                    \
+                __builtin_amdgcn_sched_barrier(0);                                                \
+                lds_split_fn_tile(s_fn_rd_ptr);                                                   \
+                s_wait_all_dscnt(0_I);                                                            \
+                __builtin_amdgcn_s_barrier();                                                     \
+                asm volatile("" ::: "memory");                                                    \
+                __builtin_amdgcn_sched_barrier(0);                                                \
+            }                                                                                     \
             _Pragma("unroll")                                                                     \
             for (int c = 0; c < n_chunks_bf16; c++) {                                             \
-                float hi_raw[repeat_n][4], lo_raw[repeat_n][4];                                   \
-                lds_read_fn_chunk_bf16(s_fn_rd_ptr, hi_raw, lo_raw, c);                           \
-                s_wait_all_dscnt(0_I);                                                            \
+                using f32x4_ = opus::vector_t<float, 4>;                                          \
+                using bf16x8_ = opus::vector_t<opus::bf16_t, 8>;                                  \
+                bf16x8_ fn_hi[repeat_n], fn_lo[repeat_n];                                         \
+                {                                                                                 \
+                    float hi_raw[repeat_n][4], lo_raw[repeat_n][4];                               \
+                    lds_read_fn_chunk_bf16(s_fn_rd_ptr, hi_raw, lo_raw, c);                       \
+                    s_wait_all_dscnt(0_I);                                                        \
+                    /* Block-interleaved fn: the two fragments ARE the float runs. */             \
+                    _Pragma("unroll")                                                             \
+                    for (int n = 0; n < repeat_n; n++) {                                          \
+                        fn_hi[n] = __builtin_bit_cast(bf16x8_,                                    \
+                            *reinterpret_cast<f32x4_*>(hi_raw[n]));                               \
+                        fn_lo[n] = __builtin_bit_cast(bf16x8_,                                    \
+                            *reinterpret_cast<f32x4_*>(lo_raw[n]));                               \
+                    }                                                                             \
+                }                                                                                 \
                 _Pragma("unroll")                                                                 \
                 for (int n = 0; n < repeat_n; n++) {                                              \
-                    /* Block-interleaved fn: the two fragments ARE the float runs. */             \
-                    using f32x4_ = opus::vector_t<float, 4>;                                      \
-                    using bf16x8_ = opus::vector_t<opus::bf16_t, 8>;                              \
-                    bf16x8_ fn_hi = __builtin_bit_cast(bf16x8_,                                   \
-                        *reinterpret_cast<f32x4_*>(hi_raw[n]));                                   \
-                    bf16x8_ fn_lo = __builtin_bit_cast(bf16x8_,                                   \
-                        *reinterpret_cast<f32x4_*>(lo_raw[n]));                                   \
-                    v_cf[n] = opus::mfma_f32_16x16x32_bf16{}(fn_hi, x_bf[c], v_cf[n]);            \
-                    v_cf[n] = opus::mfma_f32_16x16x32_bf16{}(fn_lo, x_bf[c], v_cf[n]);            \
+                    v_cf[n] = opus::mfma_f32_16x16x32_bf16{}(fn_hi[n], x_bf[c], v_cf[n]);         \
+                    v_cf[n] = opus::mfma_f32_16x16x32_bf16{}(fn_lo[n], x_bf[c], v_cf[n]);         \
                     __builtin_amdgcn_sched_barrier(0);                                            \
                 }                                                                                 \
             }                                                                                     \
@@ -832,7 +907,7 @@ namespace aiter {
         // a no-op there (falls back to fp32).
 #if MHC_BF16_MFMA
 #define MHC_PRE_GEMM_STEP(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT)                    \
-        if constexpr (w_preshuffle_bf16) {                                   \
+        if constexpr (w_preshuffle_bf16 || fn_split_bf16) {                  \
             GEMM_LOOP_BODY_BF16(BUF, LDS_SLOT, k, DO_PREFETCH);           \
         } else {                                                          \
             GEMM_LOOP_BODY(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT);               \
@@ -892,7 +967,9 @@ namespace aiter {
         dim3 block(num_warps * WARP_SIZE); \
         AITER_CHECK(hc_hidden_size % (tile_k * split_k) == 0, "hc_hidden_size must be divisible by tile_k * split_k"); \
         AITER_CHECK(hc_hidden_size >= (tile_k * split_k) * 2, "hc_hidden_size must >= tile_k * split_k * 2 stages prefetch"); \
-        mhc_pre_gemm_sqrsum_kernel<DTYPE_I, num_warps, tile_m, tile_n, tile_k, MHC_PRE_BF16, vector_fn_load><<<grid, block, 0, stream>>>( \
+        /* the host takes the fn-split path for bf16 x only: skip the fp16 instance */ \
+        if constexpr (!MHC_PRE_FN_SPLIT || std::is_same_v<DTYPE_I, opus::bf16_t>) \
+        mhc_pre_gemm_sqrsum_kernel<DTYPE_I, num_warps, tile_m, tile_n, tile_k, MHC_PRE_BF16, vector_fn_load, MHC_PRE_FN_SPLIT><<<grid, block, 0, stream>>>( \
             reinterpret_cast<float*>(out.data_ptr()), \
             reinterpret_cast<float*>(sqrsum.data_ptr()), \
             reinterpret_cast<DTYPE_I*>(x.data_ptr()), \
@@ -962,13 +1039,29 @@ namespace aiter {
         const HipDeviceGuard device_guard(x.device_id);
         const hipStream_t stream = aiter::getCurrentHIPStream();
 
-        if (w_preshuffle_bf16) {
+        AITER_CHECK(w_preshuffle_bf16 >= 0 && w_preshuffle_bf16 <= 2,
+                    "w_preshuffle_bf16 must be 0, 1 or 2, got ", w_preshuffle_bf16);
+        // Mode 2 splits a plain FP32 fn into bf16 hi/lo inside the kernel. The split is
+        // only exact for bf16 activations (x feeds the bf16 MFMA unchanged), so any
+        // other activation dtype keeps the FP32 MFMA loop.
+        const bool fn_split = w_preshuffle_bf16 == 2 && x.dtype() == AITER_DTYPE_bf16;
+        if (w_preshuffle_bf16 == 1) {
 #define MHC_PRE_BF16 true
+#define MHC_PRE_FN_SPLIT false
             MHC_PRE_GEMM_SQRSUM_KERNEL_DISPATCH(tile_k);
+#undef MHC_PRE_FN_SPLIT
+#undef MHC_PRE_BF16
+        } else if (fn_split) {
+#define MHC_PRE_BF16 false
+#define MHC_PRE_FN_SPLIT true
+            MHC_PRE_GEMM_SQRSUM_KERNEL_DISPATCH(tile_k);
+#undef MHC_PRE_FN_SPLIT
 #undef MHC_PRE_BF16
         } else {
 #define MHC_PRE_BF16 false
+#define MHC_PRE_FN_SPLIT false
             MHC_PRE_GEMM_SQRSUM_KERNEL_DISPATCH(tile_k);
+#undef MHC_PRE_FN_SPLIT
 #undef MHC_PRE_BF16
         }
     }
