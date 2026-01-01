@@ -1792,6 +1792,11 @@ def _fused_moe_impl(
             and getattr(w2, "is_shuffled", False),
             gate_up_interleave=getattr(w1, "gate_up_interleave", None),
             config_file=_metadata_config_file,
+            exact_token=(
+                None
+                if _metadata_config_file is not None
+                else get_exact_tuned_M(M, model_dim, inter_dim, E, topk)
+            ),
             _disable_inline_sort=disable_inline_sort,
             _exclude_mxmoe=exclude_mxmoe,
             q_dtype_a2=quant_dtype_a2,
@@ -2651,6 +2656,41 @@ def get_padded_M(M):
         if M >= tier:
             return tier
     return _PADDED_M_TIERS[0]
+
+
+# A tuned row whose ``_tag`` starts with this prefix is keyed on the exact
+# runtime M rather than on its get_padded_M bucket: fused_moe looks it up
+# first for that M and falls back to the bucket row otherwise. Untagged
+# rows keep bucket-only matching, so a non-power-of-two token in an existing
+# CSV stays inert unless its row is tagged.
+_EXACT_M_TAG = "exact-m"
+
+
+@functools.lru_cache(maxsize=1)
+def _exact_m_tuned_shapes():
+    """(token, model_dim, inter_dim, expert, topk) of the default tuned table's
+    exact-M rows. Read once per process, like the tuned table itself."""
+    import pandas as pd
+
+    try:
+        df = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_FMOE_FILE)
+    except Exception as e:  # noqa: BLE001 - no table, no exact rows
+        logger.warning(f"[fused_moe] exact-M rows not loaded: {e}")
+        return frozenset()
+    if "_tag" not in df.columns:
+        return frozenset()
+    df = df[df["_tag"].fillna("").astype(str).str.startswith(_EXACT_M_TAG)]
+    cols = ["token", "model_dim", "inter_dim", "expert", "topk"]
+    return frozenset(
+        tuple(int(v) for v in row) for row in df[cols].itertuples(index=False)
+    )
+
+
+@functools.lru_cache(maxsize=4096)
+def get_exact_tuned_M(M, model_dim, inter_dim, expert, topk):
+    """M if the default tuned table has an exact-M row for this shape, else None."""
+    key = (int(M), int(model_dim), int(inter_dim), int(expert), int(topk))
+    return int(M) if key in _exact_m_tuned_shapes() else None
 
 
 @dataclass
@@ -4087,7 +4127,10 @@ def get_2stage_cfgs(
     has_num_local_tokens=False,
     _exclude_mxmoe=False,
     _has_input_activation_scales=False,
+    exact_token=None,
 ):
+    """``token`` is the get_padded_M bucket. ``exact_token`` (default table
+    only) is the runtime M of an exact-M tuned row, tried before the bucket."""
     gate_mode = GateMode(gate_mode)
     cktile_mxfp4_unsafe = q_dtype_w == dtypes.fp4x2 and inter_dim % 256 != 0
     flydsl_can_take_over = _can_reroute_mxfp4_to_flydsl(
@@ -4293,12 +4336,27 @@ def get_2stage_cfgs(
         )
         logger.info("\033[0m")
 
+    exact_hit = False
+
     def _lookup_cfg(c2s):
+        nonlocal exact_hit
         if not c2s:
             return None
         primary, fallback = c2s
         lookup_keys = keys[:7] + (str(activation),) + keys[8:]
-        result = primary.get(lookup_keys, None)
+        result = None
+        if exact_token is not None and config_file is None:
+            # keys layout: (gfx, cu_num, token, ...); replace token (idx 2).
+            result = primary.get(
+                lookup_keys[:2] + (int(exact_token),) + lookup_keys[3:], None
+            )
+            if result is not None and not str(result.get("_tag", "") or "").startswith(
+                _EXACT_M_TAG
+            ):
+                result = None
+            exact_hit = result is not None
+        if result is None:
+            result = primary.get(lookup_keys, None)
         if result is None and config_file is None:
             result = fallback.get(keys_disabled, None)
         # Tier fallback: if current tier not found, try smaller tiers in descending order
@@ -4776,7 +4834,7 @@ def get_2stage_cfgs(
     if not reroute_a16wmix_bf16:
         tag = f"({kernelName1=}, {kernelName2=})"
         logger.info(
-            f"[fused_moe] using {'1stage' if run_1stage else '2stage'}{' xbf16' if run_1stage_xbf16 else ''} {'default' if cfg is None else tag} for {keys} "
+            f"[fused_moe] using {'1stage' if run_1stage else '2stage'}{' xbf16' if run_1stage_xbf16 else ''} {'default' if cfg is None else tag} for {keys}{f' (exact M={exact_token})' if exact_hit else ''} "
         )
 
     def get_block_m() -> int:
@@ -5528,6 +5586,11 @@ def fused_moe_2stages(
         and getattr(w2, "is_shuffled", False),
         gate_up_interleave=getattr(w1, "gate_up_interleave", None),
         config_file=_metadata_config_file,
+        exact_token=(
+            None
+            if _metadata_config_file is not None
+            else get_exact_tuned_M(token_num, model_dim, inter_dim, E, topk)
+        ),
         input_dtype=hidden_states.dtype,
         _has_input_activation_scales=a1_scale is not None,
     )
