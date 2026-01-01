@@ -3245,6 +3245,89 @@ void allreduce_fusion_kernel_split_launcher(RankData* _dp,
             bf16_output);
 }
 
+// Stage 1 of split AR+MHC(post): reduce-scatter + allgather store of the full-hidden
+// input into every rank's tmp buffer (compact, m x hidden_size).
+//
+// CTA b owns the contiguous rows [m*b/G, m*(b+1)/G); rank r reduces the r-th
+// contiguous 1/ngpus of that CTA's flat pack range. Every thread issues the 16-byte
+// loads of all ranks at once and reduces in registers (fp32, rank order 0..ngpus-1,
+// as reduce_scatter_cross_device_store), then stores the result to all ranks. That
+// keeps ngpus loads in flight per thread with no LDS round trip or __syncthreads per
+// pack, and each CTA touches one contiguous region per peer buffer.
+// Every rank's CTAs spin on the peers' CTAs, so all of them must be resident at the
+// same time: keep <= 64 VGPRs (four 512-thread CTAs per CU).
+template <typename T, int ngpus>
+__global__ void __attribute__((amdgpu_flat_work_group_size(1, 512), amdgpu_waves_per_eu(8)))
+reduce_scatter_allgather_rows(RankData* _dp,
+                              RankSignals sg,
+                              Signal* self_sg,
+                              int rank,
+                              int m,
+                              int hidden_size,
+                              int input_hidden_dim)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+
+    const int n_packs       = hidden_size / pack_size;
+    const int in_packs      = input_hidden_dim / pack_size;
+    const int G             = gridDim.x;
+    const int row_beg       = static_cast<int>(static_cast<int64_t>(m) * blockIdx.x / G);
+    const int row_end       = static_cast<int>(static_cast<int64_t>(m) * (blockIdx.x + 1) / G);
+    const int64_t f_beg     = static_cast<int64_t>(row_beg) * n_packs;
+    const int64_t f_len     = static_cast<int64_t>(row_end - row_beg) * n_packs;
+    const int64_t share_beg = f_beg + f_len * rank / ngpus;
+    const int64_t share_end = f_beg + f_len * (rank + 1) / ngpus;
+
+    const P* ptrs[ngpus];
+    P* tmps[ngpus];
+#pragma unroll
+    for(int r = 0; r < ngpus; ++r)
+    {
+        ptrs[r] = reinterpret_cast<const P*>(_dp->ptrs[r]);
+        tmps[r] = get_tmp_buf<P>(sg.signals[r]);
+    }
+
+    start_sync<ngpus>(sg, self_sg, rank);
+
+#pragma unroll 1
+    for(int64_t idx = share_beg + threadIdx.x; idx < share_end; idx += blockDim.x)
+    {
+        int64_t in_idx = idx;
+        if(in_packs != n_packs)
+        {
+            const int64_t row = idx / n_packs;
+            in_idx            = row * in_packs + (idx - row * n_packs);
+        }
+        P v[ngpus];
+#pragma unroll
+        for(int r = 0; r < ngpus; ++r)
+            v[r] = ptrs[r][in_idx];
+        A acc = upcast(v[0]);
+#pragma unroll
+        for(int r = 1; r < ngpus; ++r)
+        {
+            const A t = upcast(v[r]);
+#pragma unroll
+            for(int e = 0; e < pack_size; ++e)
+                acc[e] += t[e];
+        }
+        const P out = downcast<P>(acc);
+#pragma unroll
+        for(int r = 0; r < ngpus; ++r)
+            tmps[r][idx] = out;
+    }
+
+    // RELEASE/ACQUIRE (final_sync=false): stage 2 reads the peers' writes to this
+    // rank's tmp, see reduce_scatter_cross_device_store.
+    end_sync<ngpus, false>(sg, self_sg, rank);
+}
+
+// CTAs per rank for reduce_scatter_allgather_rows: enough rows per CTA to amortize
+// the per-CTA cross-rank barriers, at most kMaxBlocks signal slots.
+constexpr int kRsAgRowsMaxBlocks = 40;
+
 // Stage 2 for split AR+MHC(post) is launched via optimized mhc_post kernels on the
 // IPC tmp buffer (see launch_mhc_post_raw in fused_ar_mhc_post.cu).
 
@@ -3263,22 +3346,22 @@ void allreduce_mhc_post_split_launcher(RankData* _dp,
                                        int residual_stride,
                                        hipStream_t stream)
 {
-    const int size = m * input_hidden_dim;
+    if(m <= 0)
+        return;
     dim3 block(512);
-    int block_num = ((size / NGPUS) + 512 - 1) / 512;
-    dim3 grid(std::min(block_num, kMaxBlocks));
+    dim3 grid(std::min(m, kRsAgRowsMaxBlocks));
     switch(NGPUS)
     {
     case 8:
-        reduce_scatter_cross_device_store<T, 8><<<grid, block, 0, stream>>>(
+        reduce_scatter_allgather_rows<T, 8><<<grid, block, 0, stream>>>(
             _dp, sg, self_sg, rank, m, hidden_size, input_hidden_dim);
         break;
     case 4:
-        reduce_scatter_cross_device_store<T, 4><<<grid, block, 0, stream>>>(
+        reduce_scatter_allgather_rows<T, 4><<<grid, block, 0, stream>>>(
             _dp, sg, self_sg, rank, m, hidden_size, input_hidden_dim);
         break;
     case 2:
-        reduce_scatter_cross_device_store<T, 2><<<grid, block, 0, stream>>>(
+        reduce_scatter_allgather_rows<T, 2><<<grid, block, 0, stream>>>(
             _dp, sg, self_sg, rank, m, hidden_size, input_hidden_dim);
         break;
     default:
